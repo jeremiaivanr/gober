@@ -66,8 +66,23 @@ type executor[BT bcts.Writer, T bcts.ReadWriter[BT]] struct {
 	sagaName        string
 	version         string
 	story           Story[BT, T]
+	retryDelay      time.Duration
 	// tasks    []status
 	// taskLock sync.Mutex
+}
+
+type Option func(*options)
+
+type options struct {
+	retryDelay time.Duration
+}
+
+func WithRetryDelay(d time.Duration) Option {
+	return func(o *options) {
+		if d > 0 {
+			o.retryDelay = d
+		}
+	}
 }
 
 func Init[BT bcts.Writer, T bcts.ReadWriter[BT]](
@@ -78,10 +93,15 @@ func Init[BT bcts.Writer, T bcts.ReadWriter[BT]](
 	p stream.CryptoKeyProvider,
 	workers int,
 	ctx context.Context,
+	opts ...Option,
 ) (*executor[BT, T], error) {
 	if len(story.Actions) <= 1 {
 		err := ErrNotEnoughActions
 		return nil, err
+	}
+	o := &options{retryDelay: 10 * time.Second}
+	for _, opt := range opts {
+		opt(o)
 	}
 	ctxTask, cancel := context.WithCancel(ctx)
 	token := gsync.NewObj[string]()
@@ -112,9 +132,10 @@ func Init[BT bcts.Writer, T bcts.ReadWriter[BT]](
 		knownExecutions: gsync.NewMap[uuid.UUID, struct{}](),
 		// startPosition: gsync.NewMap[uuid.UUID, store.StreamPosition](),
 		// errors:   gsync.NewMap[uuid.UUID, chan error](),
-		es:    es,
-		close: cancel,
-		ctx:   ctxTask,
+		es:         es,
+		close:      cancel,
+		ctx:        ctxTask,
+		retryDelay: o.retryDelay,
 	}
 	discovery := local.New()
 	for actI, action := range story.Actions {
@@ -346,8 +367,8 @@ func Init[BT bcts.Writer, T bcts.ReadWriter[BT]](
 								select {
 								case <-out.ctx.Done():
 									return
-								case <-time.NewTimer(time.Second * 10).C:
-									log.Warning("slept before retry", "duration", time.Second*10)
+								case <-time.NewTimer(out.retryDelay).C:
+									log.Warning("slept before retry", "duration", out.retryDelay)
 								}
 							} else {
 								log.WithError(execErr).
