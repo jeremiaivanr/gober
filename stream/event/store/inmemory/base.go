@@ -141,6 +141,19 @@ func (es *Stream) Stream(
 	out = eventChan
 	go func() {
 		defer close(eventChan)
+		done := make(chan struct{})
+		defer close(done)
+		go func() {
+			select {
+			case <-ctx.Done():
+			case <-es.ctx.Done():
+			case <-done:
+				return
+			}
+			es.data.newData.L.Lock()
+			es.data.newData.Broadcast()
+			es.data.newData.L.Unlock()
+		}()
 		var start time.Time
 		for {
 			select {
@@ -168,10 +181,17 @@ func (es *Stream) Stream(
 					for ; position < uint64(len(es.data.db)); position++ {
 						se := es.data.db[position]
 						es.data.dbLock.RUnlock()
-						eventChan <- store.ReadEvent{
+						readEvent := store.ReadEvent{
 							Event:    se.Event,
 							Position: se.Position,
 							Created:  se.Created,
+						}
+						select {
+						case <-ctx.Done():
+							return
+						case <-es.ctx.Done():
+							return
+						case eventChan <- readEvent:
 						}
 						es.data.dbLock.RLock()
 					}
