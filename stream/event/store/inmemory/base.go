@@ -25,8 +25,14 @@ type inMemEvent struct {
 
 // stream Need to add a way to not store multiple events with the same id in the same stream.
 type stream struct {
-	dbLock   *sync.RWMutex
-	newData  *sync.Cond
+	dbLock *sync.RWMutex
+	// notify is a channel that is closed to wake blocked readers whenever new
+	// data is appended. Closing a channel is visible to synctest (unlike
+	// sync.Cond.Wait which synctest classifies as permanently blocked), so
+	// replacing sync.Cond with this pattern prevents spurious synctest
+	// deadlock panics when tests run in a synctest bubble.
+	notify   chan struct{}
+	notifyMu sync.Mutex
 	db       []inMemEvent
 	position store.StreamPosition
 }
@@ -42,9 +48,9 @@ func Init(name string, ctx context.Context) (es *Stream, err error) {
 	writeChan := make(chan store.WriteEvent, 100)
 	es = &Stream{
 		data: stream{
-			db:      make([]inMemEvent, 0),
-			dbLock:  &sync.RWMutex{},
-			newData: sync.NewCond(&sync.Mutex{}),
+			db:     make([]inMemEvent, 0),
+			dbLock: &sync.RWMutex{},
+			notify: make(chan struct{}),
 		},
 		name:      name,
 		writeChan: writeChan,
@@ -88,6 +94,8 @@ func Init(name string, ctx context.Context) (es *Stream, err error) {
 		for {
 			select {
 			case <-ctx.Done():
+				// Wake any blocked readers so they can observe ctx.Done().
+				es.data.broadcast()
 				return
 			case e := <-writeChan:
 				func() {
@@ -121,12 +129,32 @@ func Init(name string, ctx context.Context) (es *Stream, err error) {
 						}
 					}
 
-					es.data.newData.Broadcast()
+					es.data.broadcast()
 				}()
 			}
 		}
 	}()
 	return
+}
+
+// broadcast closes the current notify channel (waking all waiters) and
+// replaces it with a fresh one for the next wait cycle.
+func (s *stream) broadcast() {
+	s.notifyMu.Lock()
+	old := s.notify
+	s.notify = make(chan struct{})
+	s.notifyMu.Unlock()
+	close(old)
+}
+
+// notifyChan returns the current notification channel. Readers should capture
+// it before checking whether there is new data, then block on it if there is
+// none. This mirrors the sync.Cond pattern but uses a channel so synctest can
+// track the goroutine as blocked-on-channel rather than permanently blocked.
+func (s *stream) notifyChan() chan struct{} {
+	s.notifyMu.Lock()
+	defer s.notifyMu.Unlock()
+	return s.notify
 }
 
 func (es *Stream) Write() chan<- store.WriteEvent {
@@ -141,19 +169,6 @@ func (es *Stream) Stream(
 	out = eventChan
 	go func() {
 		defer close(eventChan)
-		done := make(chan struct{})
-		defer close(done)
-		go func() {
-			select {
-			case <-ctx.Done():
-			case <-es.ctx.Done():
-			case <-done:
-				return
-			}
-			es.data.newData.L.Lock()
-			es.data.newData.Broadcast()
-			es.data.newData.L.Unlock()
-		}()
 		var start time.Time
 		for {
 			select {
@@ -198,9 +213,22 @@ func (es *Stream) Stream(
 					dbLen := uint64(len(es.data.db))
 					es.data.dbLock.RUnlock()
 					if position >= dbLen {
-						es.data.newData.L.Lock()
-						es.data.newData.Wait()
-						es.data.newData.L.Unlock()
+						// Capture the notify channel before the check so we
+						// don't miss a broadcast that arrives between the
+						// length check and the channel receive below.
+						notify := es.data.notifyChan()
+						es.data.dbLock.RLock()
+						stillEmpty := position >= uint64(len(es.data.db))
+						es.data.dbLock.RUnlock()
+						if stillEmpty {
+							select {
+							case <-ctx.Done():
+								return
+							case <-es.ctx.Done():
+								return
+							case <-notify:
+							}
+						}
 					}
 				}
 				if readCount != nil {
